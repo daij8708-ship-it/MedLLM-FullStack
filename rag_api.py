@@ -11,7 +11,7 @@ from fastapi import FastAPI,File,Form,HTTPException,Request,UploadFile
 from fastapi.responses import FileResponse,JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel,Field
-from corpus import DATA,HOME
+from corpus import DATA,HOME,pdf_ocr_mode
 from rag_core import RAGService
 
 ROOT=Path(__file__).resolve().parent
@@ -85,7 +85,7 @@ def status():
         'answer_style':getattr(SERVICE,'answer_style','grounded_selection'),
         'candidate_scope':SERVICE.candidate_scope,'max_options':SERVICE.max_options,
         'reranker':SERVICE.reranker.name,'reranker_loaded':SERVICE.reranker.model is not None,
-        'generator_backend':SERVICE.backend}
+        'pdf_ocr':pdf_ocr_mode(),'generator_backend':SERVICE.backend}
     if SERVICE.backend=='llamacpp':
         from llama_backend import probe
         servers={}

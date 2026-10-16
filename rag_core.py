@@ -7,6 +7,7 @@ import threading
 import time
 from pathlib import Path
 from corpus import DATA, HOME, extract_sections, make_chunks
+from errors import ContextOverflowError
 from evidence_contract import selection_prompt
 from query_plan import split_questions,personal_diagnosis,missing_detail,evidence_requirements,evidence_alignment,combine_results
 from reranker import rank_options, reranker_from_env
@@ -130,6 +131,23 @@ def evidence_sentences(chunks,scope='summary_only'):
     return options
 
 
+def generate_with_context_trim(generator,options,query,role,max_tokens,cancel=None,min_options=1):
+    """按相关度裁剪候选直到提示放得下，返回 (result, dropped)。
+
+    候选已按分数降序排列，丢尾部就是丢最不相关的句子。裁剪结果由调用方写进
+    warnings，让用户看得见"这次少了哪几句"，而不是静默截断或直接报错。
+    """
+    dropped=[]
+    while True:
+        task=selection_prompt(query,options)
+        try:
+            return generator.generate(task,role,cancel=cancel,max_tokens=max_tokens),len(dropped)
+        except ContextOverflowError:
+            if len(options)<=min_options:raise
+            dropped.append(options.pop())
+            for n,option in enumerate(options):option['option']=n+1
+
+
 def selected_evidence(raw,options,chunks):
     """Strict JSON contract: malformed/out-of-range selections are rejected."""
     raw=raw.strip()
@@ -189,7 +207,7 @@ class Generator:
         messages.append({'role':'user','content':question})
         prompt=self.tokenizer.apply_chat_template(messages,tokenize=False,add_generation_prompt=True)
         inputs=self.tokenizer(prompt,return_tensors='pt',add_special_tokens=False).to('cuda')
-        if inputs.input_ids.shape[1]>2048:raise ValueError('上下文超过2048 token，请缩短问题或清空会话。')
+        if inputs.input_ids.shape[1]>2048:raise ContextOverflowError('上下文超过2048 token，请缩短问题或清空会话。')
         class Stop(StoppingCriteria):
             def __call__(self,input_ids,scores,**kwargs):return cancel is not None and cancel.is_set()
         start=time.monotonic()
@@ -285,13 +303,14 @@ class RAGService:
             if self.reranker.active:stage('重排序器正在给候选句打分…')
             options=rank_options(options,self.reranker,query,self.max_options)
             for n,s in enumerate(options):s['option']=n+1
+            role='sft' if mode=='sft_rag' else 'base'
+            result,dropped=generate_with_context_trim(self.generator,options,query,role,64,cancel=cancel)
             task=selection_prompt(query,options)
-            result=self.generator.generate(task,'sft' if mode=='sft_rag' else 'base',cancel=cancel,max_tokens=64)
             raw=result['text'];selected=selected_evidence(raw,options,chunks)
             attempts=[{'raw':raw,'constrained':False,'seconds':result['seconds'],'tokens':result['tokens']}]
             if selected is None and not result['cancelled'] and not (cancel and cancel.is_set()):
                 stage('选句格式不合法，进行一次受约束重试…')
-                retry=self.generator.generate(task,'sft' if mode=='sft_rag' else 'base',cancel=cancel,max_tokens=64,selection_count=len(options))
+                retry=self.generator.generate(task,role,cancel=cancel,max_tokens=64,selection_count=len(options))
                 attempts.append({'raw':retry['text'],'constrained':True,'seconds':retry['seconds'],'tokens':retry['tokens']})
                 retry['seconds']=round(result['seconds']+retry['seconds'],2);retry['tokens']+=result['tokens']
                 result=retry;raw=result['text'];selected=selected_evidence(raw,options,chunks)
@@ -299,9 +318,13 @@ class RAGService:
             result['invalid_citations']=[]
             result['warnings']=[w for w in result['warnings'] if not w.startswith('模型生成了不存在的引用编号')]
             if len(attempts)>1:result['warnings'].append('首轮选句格式不合法，已受约束重试一次；格式合法仍需通过证据检查。')
+            if dropped:
+                result['warnings'].append(f'候选超出上下文上限，已按相关度丢弃末尾 {dropped} 句后作答，'
+                                          f'本次只提供 {len(options)} 句候选。')
             result.update(model=mode,retrieved=chunks,raw_ranked_hits=hits,raw_model_text=raw,
                           raw_model_citations=[],selection_options=options,selection_raw=raw,
                           selection_attempts=attempts,format_retry=len(attempts)>1,
+                          context_trimmed=dropped,
                           retrieval_query=query,rewritten=rewritten,abstained=False)
             if result['cancelled']:
                 result.update(text='',citations=[],delivery_mode='cancelled');return result

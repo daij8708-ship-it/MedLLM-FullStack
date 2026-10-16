@@ -12,6 +12,8 @@ import json
 import os
 import socket
 import time
+
+from errors import ContextOverflowError
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -142,7 +144,7 @@ class LlamaServerGenerator:
         rendered = self._render_prompt(messages)
         input_tokens = self._count(rendered)
         if input_tokens and input_tokens + max_tokens > self.ctx:
-            raise ValueError(f'上下文超过 {self.ctx} token（提示 {input_tokens}），请缩短问题或清空会话。')
+            raise ContextOverflowError(f'上下文超过 {self.ctx} token（提示 {input_tokens}），请缩短问题或清空会话。')
 
         payload = {'messages': messages, 'max_tokens': max_tokens, 'temperature': self.temperature,
                    'top_p': 1.0, 'repeat_penalty': 1.0, 'stream': True,

@@ -1,0 +1,15 @@
+# 扫描件 PDF 的可选 OCR 依赖。只有把 RAG_PDF_OCR 设为 rapidocr 时才需要安装：
+#   pip install -r requirements-ocr.txt
+# 说明：
+# - rapidocr-onnxruntime 的 det/rec/cls 三个 ONNX 权重随 wheel 一起分发（约 16MB），
+#   装完即在 site-packages/rapidocr_onnxruntime/models/ 下，运行时不需要联网。
+# - pypdfium2 用来把没有文本层的页渲染成图片（纯 wheel，不依赖外部 poppler）。
+# - 许可证：两者分别是 Apache-2.0 与 BSD-3-Clause/Apache-2.0，可只作为依赖引用。
+# - 不要用 pymupdf（AGPL-3.0）替代 pypdfium2，也不要把 paddleocr 装进同一个环境
+#   （它会装 opencv-contrib-python 并把 numpy 降级，与已有 cv2/numpy 冲突）。
+rapidocr-onnxruntime==1.4.4
+pypdfium2==5.14.0
+
+# 传递依赖（交给 pip 解析即可，这里只记实测版本，避免装错分支）：
+#   opencv-python==5.0.0.93  pyclipper==1.4.0  shapely==2.2.0
+#   onnxruntime / numpy / pillow / PyYAML / six / tqdm 主环境已满足，不要重复钉版本。

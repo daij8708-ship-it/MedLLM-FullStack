@@ -13,6 +13,7 @@ Protocol (also stored in the artefact):
 """
 import hashlib
 import json
+from collections import Counter
 from pathlib import Path
 
 from evidence_index import DATA, dump_index, load_chunks, normalize, reachable_keys, split_sentences
@@ -80,12 +81,57 @@ ANNOTATIONS = {
         'n07': (['C3'], ['C3'], 'co'),
         'n08': (['S2'], ['S1', 'S2'], 'smoke'),
     },
+    # 扩充集：问题只写一次，标签仍全部取自冻结语料句子；本题集在写完之后才第一次跑评测。
+    'expansion': {
+        'e01': (['F1'], ['F1'], 'food'),
+        'e02': (['F2'], ['F2'], 'food'),
+        'e03': (['F3'], ['F3'], 'food'),
+        'e04': (['F3'], ['F3'], 'food'),
+        'e05': (['F4'], ['F4'], 'food'),
+        'e06': (['F2', 'F3'], ['F2', 'F3'], 'food'),
+        'e07': (['F1'], ['F1', 'F2', 'F3'], 'food'),
+        'e08': (['F3', 'F4'], ['F3', 'F4'], 'food'),
+        'e09': (['O1'], ['O1'], 'oral'),
+        'e10': (['O1'], ['O1'], 'oral'),
+        'e11': (['O2'], ['O2'], 'oral'),
+        'e12': (['O2'], ['O2'], 'oral'),
+        'e13': (['O3'], ['O3'], 'oral'),
+        'e14': (['O1', 'O3'], ['O1', 'O3'], 'oral'),
+        'e15': (['O1', 'O3'], ['O1', 'O2', 'O3'], 'oral'),
+        'e16': (['P1'], ['P1'], 'prediabetes'),
+        'e17': (['P1'], ['P1'], 'prediabetes'),
+        'e18': (['P2'], ['P2'], 'prediabetes'),
+        'e19': (['P2'], ['P2'], 'prediabetes'),
+        'e20': (['P2'], ['P1', 'P2'], 'prediabetes'),
+        'e21': (['P3'], ['P3'], 'prediabetes'),
+        'e22': (['P1', 'P2'], ['P1', 'P2'], 'prediabetes'),
+        'e23': (['C1'], ['C1'], 'co'),
+        'e24': (['C3'], ['C3'], 'co'),
+        'e25': (['C1', 'C2'], ['C1', 'C2'], 'co'),
+        'e26': (['C2', 'C3'], ['C2', 'C3'], 'co'),
+        'e27': (['C1'], ['C1'], 'co'),
+        'e28': (['H1'], ['H1'], 'heat'),
+        'e29': (['H2'], ['H2'], 'heat'),
+        'e30': (['H3'], ['H3'], 'heat'),
+        'e31': (['H4'], ['H4'], 'heat'),
+        'e32': (['H1', 'H2', 'H3'], ['H1', 'H2', 'H3', 'H4'], 'heat'),
+        'e33': (['H2'], ['H2'], 'heat'),
+        'e34': (['H1'], ['H1'], 'heat'),
+        'e35': (['S1'], ['S1'], 'smoke'),
+        'e36': (['S2'], ['S1', 'S2'], 'smoke'),
+        'e37': (['S3'], ['S3'], 'smoke'),
+        'e38': (['S2'], ['S2'], 'smoke'),
+    },
 }
 
+SUITES = ('dev22', 'frozen16', 'regression16', 'expansion')
+
+# 扩充集的问题清单随仓库分发，第三方不必依赖任何运行产物就能重建金标准。
 CASE_SOURCES = {
     'dev22': DATA / 'user-acceptance-llamacpp' / 'results.json',
     'frozen16': DATA / 'alignment-final-frozen.json',
     'regression16': DATA / 'final-health-v2-frozen.json',
+    'expansion': Path(__file__).resolve().parent / 'evidence_expansion_cases.json',
 }
 
 
@@ -114,6 +160,15 @@ def load_cases(suite):
     return out
 
 
+def case_kind(suite, ident, case):
+    """answer / refuse；既没标注又不带 refuse 标记的案例直接报错，不允许静默跳过。"""
+    if ident in ANNOTATIONS[suite]:
+        return 'answer'
+    if case.get('refuse'):
+        return 'refuse'
+    raise SystemExit(f'{suite}/{ident}: 没有标注也不带 refuse 标记，会被静默跳过，拒绝构建金标准。')
+
+
 def build():
     _, payload = dump_index(scope='retrieved_sentences')
     index, resolved = payload['index'], resolve_labels(payload['index'])
@@ -121,17 +176,16 @@ def build():
     for entry in index:
         doc_keys.setdefault(entry['doc_id'], []).append(entry['key'])
     cases, counts = [], {'answer': 0, 'refuse': 0}
-    for suite in ('dev22', 'frozen16', 'regression16'):
+    for suite in SUITES:
         source = load_cases(suite)
         for ident in sorted(source):
             case = source[ident]
-            if ident not in ANNOTATIONS[suite]:
-                if case.get('refuse'):
-                    counts['refuse'] += 1
-                    cases.append({'suite': suite, 'id': ident, 'question': case['q'],
-                                  'expected': 'refuse', 'core_labels': [], 'acceptable_labels': [],
-                                  'core': [], 'acceptable': [], 'doc_scope': [],
-                                  'expected_doc': None, 'previous': case.get('previous')})
+            if case_kind(suite, ident, case) == 'refuse':
+                counts['refuse'] += 1
+                cases.append({'suite': suite, 'id': ident, 'question': case['q'],
+                              'expected': 'refuse', 'core_labels': [], 'acceptable_labels': [],
+                              'core': [], 'acceptable': [], 'doc_scope': [],
+                              'expected_doc': None, 'previous': case.get('previous')})
                 continue
             core_labels, acceptable_labels, doc = ANNOTATIONS[suite][ident]
             assert set(core_labels) <= set(acceptable_labels), f'{suite}/{ident}: core not subset'
@@ -145,16 +199,18 @@ def build():
                           'doc_scope': scope, 'expected_doc': doc,
                           'previous': case.get('previous')})
     reachable_narrow = len(reachable_keys(load_chunks(), 'summary_only'))
+    answers = [c for c in cases if c['expected'] == 'answer']
+    core_sizes = Counter(len(c['core']) for c in answers)
     gold = {
-        'name': 'evidence-gold-v2',
-        'supersedes': 'evidence-gold-v1',
+        'name': 'evidence-gold-v3',
+        'supersedes': 'evidence-gold-v2',
         'corpus_sha256': payload['corpus_sha256'],
         'sentence_index': {'chunks': payload['chunks'], 'sentences': payload['sentences'],
                            'editorial_summary_sentences': payload['editorial_summary_sentences'],
                            'reachable_summary_only': reachable_narrow,
                            'reachable_retrieved_sentences': payload['reachable_by_selector']},
         'protocol': {
-            'core': '句子直接包含回答问题所需事实（召回分母）',
+            'core': '句子直接包含回答问题所需事实（召回分母）；一题需要几个事实就标几句，不强行凑成一句',
             'acceptable': '允许展示且不算答非所问的句子，core 的超集（严格精确率分母）',
             'doc_scope': '答案文档的全部句子（宽松精确率分母）；v1 只算了该文档的中文导读句',
             'padding': '选中但在 acceptable 内、仍在 doc_scope 内 = 同文档冗余引用',
@@ -165,12 +221,19 @@ def build():
                       '构造出来的恒等式而不是模型能力；同时旧切分器不切英文句点，英文段落大多整块成一句。'
                       'v2 修正切分并把 doc_scope 扩到答案文档全部句子，core/acceptable 保持 v1 的导读句不变，'
                       '因此召回与 exact 仍可与 v1 直接比较。',
+            'why_v3': '扩充集（suite=expansion）的 56 道题在写完后才第一次跑评测，因此可以用它检验'
+                      '在开发回归集上得到的结论；问题清单随仓库分发（evidence_expansion_cases.json），'
+                      '不依赖任何运行产物即可重建。core 允许由 2~3 句事实单元组成，'
+                      '以改善"core 常为 1 句、召回只能取 0/0.5/1"的分辨率问题。'
+                      '本版同时把"未标注又不带 refuse 标记"的案例从静默跳过改为构建期报错。',
         },
         'label_map': {k: {'key': v['key'], 'doc_id': v['doc_id'], 'text': v['text']} for k, v in resolved.items()},
-        'counts': {'cases': len(cases), **counts},
+        'counts': {'cases': len(cases), **counts,
+                   'core_sentences_per_answer_case': {str(k): v for k, v in sorted(core_sizes.items())},
+                   'answer_cases_needing_multiple_sentences': sum(v for k, v in core_sizes.items() if k > 1)},
         'cases': cases,
     }
-    target = DATA / 'gold' / 'evidence-gold-v2.json'
+    target = DATA / 'gold' / 'evidence-gold-v3.json'
     target.write_text(json.dumps(gold, ensure_ascii=False, indent=2), encoding='utf-8')
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     return target, gold, digest
@@ -181,8 +244,9 @@ if __name__ == '__main__':
     print(f'wrote {target}')
     print(f"sha256 {digest}")
     print(f"cases={gold['counts']['cases']} answer={gold['counts']['answer']} refuse={gold['counts']['refuse']}")
-    from collections import Counter
-    for suite in ('dev22', 'frozen16', 'regression16'):
+    print(f"core 句数分布={gold['counts']['core_sentences_per_answer_case']} "
+          f"需要多句事实的题数={gold['counts']['answer_cases_needing_multiple_sentences']}")
+    for suite in SUITES:
         sub = [c for c in gold['cases'] if c['suite'] == suite]
         print(f"  {suite:14s} {len(sub):3d} case  answer={sum(c['expected']=='answer' for c in sub)} "
               f"refuse={sum(c['expected']=='refuse' for c in sub)}")

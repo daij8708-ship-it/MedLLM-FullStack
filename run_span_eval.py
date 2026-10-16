@@ -22,7 +22,7 @@ from reranker import RERANKERS
 from span_metrics import aggregate, candidate_reachability, selection_metrics
 from workspace import RAG as DATA
 
-GOLD = DATA / 'gold' / 'evidence-gold-v2.json'
+GOLD = DATA / 'gold' / 'evidence-gold-v3.json'
 BASE_URL = 'http://127.0.0.1:7860'
 
 

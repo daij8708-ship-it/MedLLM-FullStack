@@ -7,6 +7,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 import rag_api
 from corpus import extract_sections,make_chunks
+from errors import ContextOverflowError
 from rag_core import RAGService,rewrite_query,resolve_citations,selected_evidence,evidence_sentences,missing_evidence_requirement
 from query_plan import split_questions,personal_diagnosis,missing_detail,evidence_requirements,evidence_alignment,combine_results
 from selection_constraints import selection_trie,allowed_next,selection_gbnf
@@ -341,7 +342,7 @@ class SpanMetricTests(unittest.TestCase):
 class GoldIntegrityTests(unittest.TestCase):
     """The gold artefact must stay a subset of the frozen corpus."""
 
-    GOLD = RAG / 'gold' / 'evidence-gold-v2.json'
+    GOLD = RAG / 'gold' / 'evidence-gold-v3.json'
     INDEX = RAG / 'gold' / 'sentence-index.json'
 
     def setUp(self):
@@ -384,6 +385,44 @@ class GoldIntegrityTests(unittest.TestCase):
         self.assertEqual(len(wide), len(answerable), '每道可答题的 doc_scope 都应包含非导读句')
         for case in answerable:
             self.assertTrue(set(case['acceptable']) <= set(case['doc_scope']), f"{case['suite']}/{case['id']}")
+
+    def test_expansion_suite_is_present_and_sized_as_documented(self):
+        """扩充集必须在产物里、题数与 builder 自报的数字一致。"""
+        self.assertEqual(self.gold['name'], 'evidence-gold-v3')
+        sub = [c for c in self.gold['cases'] if c['suite'] == 'expansion']
+        self.assertEqual(len(sub), 56)
+        self.assertEqual(sum(c['expected'] == 'answer' for c in sub), 38)
+        self.assertEqual(sum(c['expected'] == 'refuse' for c in sub), 18)
+
+    def test_questions_are_unique_across_suites(self):
+        questions = [c['question'] for c in self.gold['cases']]
+        duplicates = {q for q in questions if questions.count(q) > 1}
+        self.assertEqual(duplicates, set())
+
+    def test_some_answer_cases_need_several_sentences(self):
+        """core 全是一句的话召回分辨率只能取 0/0.5/1，扩充集必须写出多句事实单元。"""
+        multi = [c for c in self.gold['cases'] if c['expected'] == 'answer' and len(c['core']) > 1]
+        self.assertGreaterEqual(len(multi), 8)
+        self.assertEqual(self.gold['counts']['answer_cases_needing_multiple_sentences'], len(multi))
+
+    def test_expansion_source_ships_with_the_repo_and_marks_refusals(self):
+        """扩充集的问题清单要随仓库分发，且每题都显式写 refuse，不留静默缺省。"""
+        source = Path(__file__).resolve().parent / 'evidence_expansion_cases.json'
+        self.assertTrue(source.exists())
+        cases = json.loads(source.read_text(encoding='utf-8'))
+        self.assertEqual(len(cases), 56)
+        for case in cases:
+            self.assertIn('refuse', case, case['id'])
+            self.assertIsInstance(case['refuse'], bool, case['id'])
+            self.assertTrue(case['q'].strip(), case['id'])
+
+    def test_unlabelled_case_without_refusal_flag_is_rejected(self):
+        """未标注又不标 refuse 的案例以前会被静默跳过，现在必须报错。"""
+        import gold_span
+        with self.assertRaises(SystemExit):
+            gold_span.case_kind('expansion', 'zz', {'id': 'zz', 'q': '测试'})
+        self.assertEqual(gold_span.case_kind('expansion', 'zz', {'id': 'zz', 'refuse': True}), 'refuse')
+        self.assertEqual(gold_span.case_kind('expansion', 'e01', {'id': 'e01'}), 'answer')
 
 
 class CandidateScopeTests(unittest.TestCase):
@@ -483,6 +522,104 @@ class RerankerTests(unittest.TestCase):
             self.skipTest('重排序权重已存在，这里只验证缺权重时的报错')
         with self.assertRaises(RuntimeError):
             service.scores('q', ['句子'])
+
+
+class ContextTrimTests(unittest.TestCase):
+    """提示超限时按相关度裁剪候选并声明，而不是把错误直接抛给用户。"""
+
+    @staticmethod
+    def _options(count):
+        return [{'option': i, 'chunk_index': 0, 'text': f'这是第{i}句候选，长度足够进入选句提示。',
+                 'sentence_score': 1 - i / 10} for i in range(1, count + 1)]
+
+    def _fake(self, fail_times):
+        calls = []
+
+        class FakeGenerator:
+            def generate(self, task, role, cancel=None, max_tokens=0, selection_count=None):
+                calls.append(task)
+                if len(calls) <= fail_times:
+                    raise ContextOverflowError('上下文超过 4096 token（提示 5000）')
+                return {'text': '{"sentences":[1]}', 'tokens': 5, 'seconds': 0.1,
+                        'warnings': [], 'cancelled': False}
+
+        return FakeGenerator(), calls
+
+    def test_trim_drops_the_lowest_scored_candidates_and_reports_the_count(self):
+        import rag_core
+        options = self._options(6)
+        generator, calls = self._fake(fail_times=1)
+        result, dropped = rag_core.generate_with_context_trim(generator, options, '问题', 'base', 64)
+        self.assertEqual(dropped, 1)
+        self.assertEqual(len(options), 5)
+        self.assertEqual([o['option'] for o in options], [1, 2, 3, 4, 5])
+        self.assertIn('第5句', calls[1], '裁剪后重试的提示里应保留更相关的候选')
+        self.assertNotIn('第6句', calls[1], '被丢弃的候选不能还留在提示里')
+        self.assertEqual(result['text'], '{"sentences":[1]}')
+
+    def test_trimming_stops_at_one_candidate_and_then_raises(self):
+        import rag_core
+        options = self._options(3)
+        generator, calls = self._fake(fail_times=99)
+        with self.assertRaises(ContextOverflowError):
+            rag_core.generate_with_context_trim(generator, options, '问题', 'base', 64)
+        self.assertEqual(len(options), 1, '只剩一句候选时必须停手，交给上层报错')
+        self.assertEqual(len(calls), 3)
+
+
+class PdfOcrTests(unittest.TestCase):
+    """扫描件走 OCR 必须是显式开关；缺依赖时明确报错，不静默降级。"""
+
+    @staticmethod
+    def _textless_pdf():
+        import io
+        from pypdf import PdfWriter
+        writer = PdfWriter()
+        writer.add_blank_page(width=595, height=842)
+        buffer = io.BytesIO()
+        writer.write(buffer)
+        return buffer.getvalue()
+
+    def test_default_mode_is_off(self):
+        import corpus
+        self.assertEqual(corpus.pdf_ocr_mode(), 'off')
+
+    def test_unknown_mode_is_rejected_not_silently_ignored(self):
+        import os, corpus
+        os.environ['RAG_PDF_OCR'] = 'tesseract'
+        try:
+            with self.assertRaises(ValueError):
+                corpus.pdf_ocr_mode()
+        finally:
+            os.environ.pop('RAG_PDF_OCR', None)
+
+    def test_textless_pdf_is_rejected_with_the_switch_name(self):
+        import corpus
+        with self.assertRaises(ValueError) as ctx:
+            corpus.extract_sections(self._textless_pdf(), 'scan.pdf')
+        self.assertIn('RAG_PDF_OCR', str(ctx.exception))
+
+    def test_ocr_enabled_without_dependencies_says_what_to_install(self):
+        import os, corpus
+        os.environ['RAG_PDF_OCR'] = 'rapidocr'
+        try:
+            try:
+                import rapidocr_onnxruntime  # noqa: F401
+                self.skipTest('本机已安装 rapidocr，缺依赖分支无法在这里复现')
+            except ImportError:
+                pass
+            with self.assertRaises(ValueError) as ctx:
+                corpus.extract_sections(self._textless_pdf(), 'scan.pdf')
+            self.assertIn('requirements-ocr.txt', str(ctx.exception))
+        finally:
+            os.environ.pop('RAG_PDF_OCR', None)
+
+    def test_only_pages_without_a_text_layer_go_to_ocr(self):
+        """混合文档里，有文本层的页不能被 OCR 覆盖掉。"""
+        import corpus
+        pages = [{'page': 1, 'text': '这一页有文本层'}, {'page': 2, 'text': '  '},
+                 {'page': 3, 'text': '第三页也有文本'}, {'page': 4, 'text': ''}]
+        self.assertEqual(corpus.pages_needing_ocr(pages), [2, 4])
 
 
 

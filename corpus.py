@@ -1,6 +1,8 @@
 """可复现的 CDC 语料；原始 HTML 与切好的块一起留在工作目录下（见 workspace.py）。"""
 import hashlib
+import io
 import json
+import os
 import re
 import time
 import urllib.request
@@ -23,19 +25,68 @@ SOURCES=[
 ]
 
 
+PDF_OCR_MODES=('off','rapidocr')
+_OCR_ENGINE=None
+
+
+def pdf_ocr_mode():
+    """显式开关：off 保持"没有文本层就报错"的旧行为，rapidocr 才走 OCR。"""
+    mode=os.environ.get('RAG_PDF_OCR','off')
+    if mode not in PDF_OCR_MODES:
+        raise ValueError('RAG_PDF_OCR 只支持 '+' / '.join(PDF_OCR_MODES)+'。')
+    return mode
+
+
+def _ocr_engine():
+    """惰性加载；权重随 rapidocr-onnxruntime 一起安装，无需联网。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        from rapidocr_onnxruntime import RapidOCR
+        _OCR_ENGINE=RapidOCR()
+    return _OCR_ENGINE
+
+
+def ocr_pdf_pages(data,page_numbers,dpi=200):
+    """只对没有文本层的页做 OCR，返回与 page_numbers 等长的文本列表。"""
+    try:
+        import pypdfium2 as pdfium
+        engine=_ocr_engine()
+    except ImportError as exc:
+        raise ValueError('这份 PDF 没有文本层，需要 OCR：请安装 requirements-ocr.txt'
+                         '（rapidocr-onnxruntime + pypdfium2），并设置 RAG_PDF_OCR=rapidocr。') from exc
+    document=pdfium.PdfDocument(io.BytesIO(data))
+    texts=[]
+    for number in page_numbers:
+        image=document[number-1].render(scale=dpi/72).to_pil().convert('RGB')
+        lines,_=engine(image)
+        texts.append('\n'.join(line[1] for line in lines if len(line)>1).strip() if lines else '')
+    return texts
+
+
+def pages_needing_ocr(pages):
+    """返回没有文本层的页码：有文本的页永远走 pypdf，不被 OCR 覆盖。"""
+    return [page['page'] for page in pages if not page['text'].strip()]
+
+
 def extract_sections(data, filename):
-    """Return page/section text; scanned PDFs without text are explicitly rejected."""
+    """Return page/section text; scanned pages go through OCR only when RAG_PDF_OCR enables it."""
     suffix=Path(filename).suffix.lower()
     if suffix=='.pdf':
         from pypdf import PdfReader
-        import io
         reader=PdfReader(io.BytesIO(data))
         if reader.is_encrypted:
             raise ValueError('暂不支持加密PDF。')
         if len(reader.pages)>200:raise ValueError('PDF最多支持200页，请拆分文档。')
-        result=[{'section':f'第{i+1}页','page':i+1,'text':p.extract_text() or ''} for i,p in enumerate(reader.pages)]
+        result=[{'section':f'第{i+1}页','page':i+1,'text':(p.extract_text() or '').strip()} for i,p in enumerate(reader.pages)]
+        blank=pages_needing_ocr(result)
+        if blank and pdf_ocr_mode()=='rapidocr':
+            by_number={page['page']:page for page in result}
+            for number,text in zip(blank,ocr_pdf_pages(data,blank)):
+                by_number[number]['text']=text;by_number[number]['ocr']=True
         if not any(x['text'].strip() for x in result):
-            raise ValueError('PDF未提取到文字；当前不支持扫描件OCR。')
+            if pdf_ocr_mode()=='rapidocr':
+                raise ValueError('PDF未提取到文字，OCR 也没有识别出内容；请检查扫描质量或改用文字版 PDF。')
+            raise ValueError('PDF未提取到文字（扫描件）；可安装 requirements-ocr.txt 并设置 RAG_PDF_OCR=rapidocr 后再上传。')
         return result
     text=data.decode('utf-8-sig',errors='strict')
     if suffix in ('.html','.htm'):
@@ -83,6 +134,7 @@ def make_chunks(doc,sections,size=700,overlap=80):
                 'section':sec['section'],'page':sec['page'],'start':start,'end':start+len(part),
                 'updated':doc.get('updated','unknown'),'fetched':doc.get('fetched','unknown'),
                 'license':doc.get('license','user-provided'),'kind':sec.get('kind','original'),
+                'ocr':bool(sec.get('ocr',False)),
                 'raw_sha256':doc.get('raw_sha256','')}})
     return chunks
 
