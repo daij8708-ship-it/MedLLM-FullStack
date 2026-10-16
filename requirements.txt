@@ -1,0 +1,18 @@
+# 应用运行依赖。
+# torch 不在此列：本机部署按 CUDA 版本从 PyTorch 官方索引安装，容器镜像里装 CPU 版
+# （嵌入模型 BGE-M3 本来就在 CPU 上跑，见 rag_core.Retriever 的 device='cpu'）。
+beautifulsoup4==4.15.0
+chromadb==1.5.9
+fastapi==0.143.2
+httpx==0.28.1
+numpy==2.4.6
+pypdf==6.20.1
+pydantic==2.14.1
+python-multipart==0.0.32
+sentence-transformers==6.1.0
+uvicorn==0.54.0
+
+# 仅 Transformers 回退后端需要（默认 llama.cpp 后端由独立的 llama-server 进程提供）：
+# transformers==5.20.0
+# peft==0.21.2
+# bitsandbytes==0.50.2

@@ -1,0 +1,39 @@
+name: 测试与镜像构建
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: 安装单测依赖
+        run: pip install -r requirements-test.txt
+      - name: 语法编译检查
+        run: python -m compileall -q .
+      - name: 前端脚本语法检查
+        run: node --check static/app.js
+      - name: 单元测试（空工作目录，权重相关用例自动 skip）
+        run: python -m unittest test_rag -v
+        env:
+          MEDLLM_HOME: /tmp/medllm-empty
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: unit-tests
+    steps:
+      - uses: actions/checkout@v4
+      - name: 构建 test 阶段镜像
+        run: docker build --target test -t medllm-test .
+      - name: 在容器内执行同一测试集
+        run: docker run --rm medllm-test
+      - name: 构建 serve 阶段镜像（仅验证 Dockerfile 与依赖可安装，不含权重）
+        run: docker build --target serve -t medllm-serve .

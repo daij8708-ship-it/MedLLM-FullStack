@@ -1,0 +1,10 @@
+# 单元测试所需的最小依赖。
+# 生成模型（torch / transformers / peft）与向量库（chromadb / sentence-transformers）
+# 都在函数内部惰性导入，测试链路不加载权重，因此这里不出现它们。
+beautifulsoup4==4.15.0
+fastapi==0.143.2
+httpx==0.28.1
+pypdf==6.20.1
+pydantic==2.14.1
+python-multipart==0.0.32
+uvicorn==0.54.0

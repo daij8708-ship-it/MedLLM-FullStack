@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.git/
+.github/
+.dockerignore
+Dockerfile
+*.log
