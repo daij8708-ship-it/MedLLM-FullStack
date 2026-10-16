@@ -18,10 +18,11 @@ from pathlib import Path
 import httpx
 
 from evidence_index import normalize
+from reranker import RERANKERS
 from span_metrics import aggregate, candidate_reachability, selection_metrics
 from workspace import RAG as DATA
 
-GOLD = DATA / 'gold' / 'evidence-gold-v1.json'
+GOLD = DATA / 'gold' / 'evidence-gold-v2.json'
 BASE_URL = 'http://127.0.0.1:7860'
 
 
@@ -88,6 +89,10 @@ def wait_job(client, job_id, timeout=240):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--backend', required=True, choices=['llamacpp', 'transformers'])
+    ap.add_argument('--candidate-scope', required=True, choices=['summary_only', 'retrieved_sentences'],
+                    help='必须与服务实际使用的候选范围一致，否则拒绝运行。')
+    ap.add_argument('--reranker', required=True, choices=list(RERANKERS),
+                    help='必须与服务实际使用的重排序器一致，否则拒绝运行。')
     ap.add_argument('--modes', default='rag,sft_rag')
     ap.add_argument('--tag', default='v1')
     ap.add_argument('--allow-errors', action='store_true')
@@ -102,6 +107,11 @@ def main():
         raise SystemExit('服务正忙，未运行评测（不干扰进行中的任务）。')
     if status.get('generator_backend') != args.backend:
         raise SystemExit(f"服务后端是 {status.get('generator_backend')}，与 --backend {args.backend} 不符，拒绝误标。")
+    if status.get('candidate_scope') != args.candidate_scope:
+        raise SystemExit(f"服务候选范围是 {status.get('candidate_scope')}，与 --candidate-scope "
+                         f"{args.candidate_scope} 不符，拒绝误标。")
+    if status.get('reranker') != args.reranker:
+        raise SystemExit(f"服务重排序器是 {status.get('reranker')}，与 --reranker {args.reranker} 不符，拒绝误标。")
 
     started = time.strftime('%Y-%m-%dT%H:%M:%S')
     rows, summaries = [], {}
@@ -148,14 +158,17 @@ def main():
         block['gold_never_offered'] = unreachable
         summaries[mode] = block
 
-    artefact = {'tag': args.tag, 'backend': args.backend, 'modes': modes, 'started': started,
+    slug = f"{args.backend}-{args.candidate_scope}-{args.reranker}"
+    artefact = {'tag': args.tag, 'backend': args.backend, 'candidate_scope': args.candidate_scope,
+                'reranker': args.reranker,
+                'modes': modes, 'started': started,
                 'finished': time.strftime('%Y-%m-%dT%H:%M:%S'),
                 'gold_sha256': hashlib.sha256(gold_bytes).hexdigest(),
                 'gold_name': gold['name'], 'corpus_sha256': gold['corpus_sha256'],
                 'status': status, 'summaries': summaries, 'rows': rows}
-    target = DATA / f'span-eval-{args.backend}-{args.tag}.json'
+    target = DATA / f"span-eval-{slug}-{args.tag}.json"
     target.write_text(json.dumps(artefact, ensure_ascii=False, indent=2), encoding='utf-8')
-    summary_target = DATA / f'span-eval-{args.backend}-{args.tag}-summary.json'
+    summary_target = DATA / f"span-eval-{slug}-{args.tag}-summary.json"
     summary_target.write_text(json.dumps({k: v for k, v in artefact.items() if k != 'rows'},
                                         ensure_ascii=False, indent=2), encoding='utf-8')
     errors = sum(1 for r in rows if r['error'])

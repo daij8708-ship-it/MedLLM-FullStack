@@ -341,7 +341,7 @@ class SpanMetricTests(unittest.TestCase):
 class GoldIntegrityTests(unittest.TestCase):
     """The gold artefact must stay a subset of the frozen corpus."""
 
-    GOLD = RAG / 'gold' / 'evidence-gold-v1.json'
+    GOLD = RAG / 'gold' / 'evidence-gold-v2.json'
     INDEX = RAG / 'gold' / 'sentence-index.json'
 
     def setUp(self):
@@ -374,6 +374,117 @@ class GoldIntegrityTests(unittest.TestCase):
         import evidence_index
         self.assertEqual(evidence_index.sentence_key('c', ' 甲。 \n 乙。 '),
                          evidence_index.sentence_key('c', '甲。 乙。'))
+
+    def test_doc_scope_covers_more_than_the_editorial_summary(self):
+        """v2 的宽松分母必须是答案文档全部句子，否则 lenient_precision 又是恒等式。"""
+        summary = {e['key'] for e in self.index['index'] if e['in_editorial_summary']}
+        answerable = [c for c in self.gold['cases'] if c['expected'] == 'answer']
+        self.assertTrue(answerable)
+        wide = [c for c in answerable if set(c['doc_scope']) - summary]
+        self.assertEqual(len(wide), len(answerable), '每道可答题的 doc_scope 都应包含非导读句')
+        for case in answerable:
+            self.assertTrue(set(case['acceptable']) <= set(case['doc_scope']), f"{case['suite']}/{case['id']}")
+
+
+class CandidateScopeTests(unittest.TestCase):
+    """The selector's candidate universe is switchable and must stay auditable."""
+
+    CHUNKS = [{'text': '成人应每天使用含氟牙膏认真刷牙两次，并使用牙线清洁牙缝以去除牙菌斑。即使戴假牙，也应至少每年看一次牙医。',
+               'metadata': {'kind': 'editorial_summary'}},
+              {'text': 'Wash your hands before, during, and after preparing food. Keep raw meat away from other foods.',
+               'metadata': {'kind': 'original'}}]
+
+    def test_summary_only_skips_later_non_summary_chunks(self):
+        from rag_core import evidence_sentences
+        options = evidence_sentences(self.CHUNKS, 'summary_only')
+        self.assertEqual({o['chunk_index'] for o in options}, {0})
+
+    def test_retrieved_sentences_lets_every_chunk_contribute(self):
+        from rag_core import evidence_sentences
+        options = evidence_sentences(self.CHUNKS, 'retrieved_sentences')
+        self.assertEqual({o['chunk_index'] for o in options}, {0, 1})
+        self.assertEqual([o['option'] for o in options], list(range(1, len(options) + 1)))
+
+    def test_unknown_scope_is_rejected_not_silently_defaulted(self):
+        from rag_core import evidence_sentences
+        with self.assertRaises(ValueError):
+            evidence_sentences(self.CHUNKS, 'everything')
+
+    def test_english_sentences_split_on_period_but_not_on_decimals(self):
+        import evidence_index
+        parts = evidence_index.split_sentences(
+            'Refrigerate at 40°F (about 4°C). Bacteria grow fast above that. Use 2.5 hours as a limit.')
+        self.assertEqual(len(parts), 3)
+        self.assertIn('Use 2.5 hours as a limit.', parts)
+
+    def test_service_rejects_a_bad_candidate_scope(self):
+        import os, rag_core
+        os.environ['RAG_CANDIDATE_SCOPE'] = 'everything'
+        try:
+            with self.assertRaises(ValueError):
+                rag_core.RAGService()
+        finally:
+            os.environ.pop('RAG_CANDIDATE_SCOPE', None)
+
+
+class RerankerTests(unittest.TestCase):
+    """重排序决定哪些候选进模型视野，所以开关必须显式、可测、缺权重时明确报错。"""
+
+    @staticmethod
+    def _options():
+        return [{'option': 1, 'chunk_index': 0, 'text': '甲句', 'sentence_score': 0.9},
+                {'option': 2, 'chunk_index': 0, 'text': '乙句', 'sentence_score': 0.5},
+                {'option': 3, 'chunk_index': 1, 'text': '丙句', 'sentence_score': 0.1}]
+
+    def test_none_keeps_dense_order_and_truncates(self):
+        from reranker import SentenceReranker, rank_options
+        kept = rank_options(self._options(), SentenceReranker('none'), 'q', 2)
+        self.assertEqual([o['text'] for o in kept], ['甲句', '乙句'])
+        self.assertNotIn('rerank_score', kept[0])
+
+    def test_cross_encoder_can_rescue_a_low_dense_candidate(self):
+        from reranker import rank_options
+
+        class Fake:
+            active = True
+
+            def scores(self, query, texts):
+                return [0.1, 0.2, 3.0]
+
+        kept = rank_options(self._options(), Fake(), 'q', 2)
+        self.assertEqual([o['text'] for o in kept], ['丙句', '乙句'])
+        # 截断在打分之后，否则低稠密分的候选永远进不了模型视野。
+        self.assertEqual(kept[0]['rerank_score'], 3.0)
+
+    def test_unknown_reranker_is_rejected_not_silently_defaulted(self):
+        import os, reranker
+        os.environ['RAG_RERANKER'] = 'cross_encoder'
+        try:
+            with self.assertRaises(ValueError):
+                reranker.reranker_from_env()
+        finally:
+            os.environ.pop('RAG_RERANKER', None)
+
+    def test_service_rejects_a_bad_reranker(self):
+        import os, rag_core
+        os.environ['RAG_RERANKER'] = 'cross_encoder'
+        try:
+            with self.assertRaises(ValueError):
+                rag_core.RAGService()
+        finally:
+            os.environ.pop('RAG_RERANKER', None)
+
+    def test_missing_weights_fail_only_when_the_reranker_is_used(self):
+        from reranker import SentenceReranker
+        service = SentenceReranker('bge_reranker_v2_m3')
+        self.assertTrue(service.active)
+        self.assertIsNone(service.model)
+        if service.path.exists():
+            self.skipTest('重排序权重已存在，这里只验证缺权重时的报错')
+        with self.assertRaises(RuntimeError):
+            service.scores('q', ['句子'])
+
+
 
 
 if __name__=='__main__':unittest.main()

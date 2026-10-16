@@ -83,6 +83,8 @@ def status():
         'documents':len(documents)+len(uploads),'chunks':SERVICE.retriever.collection.count() if SERVICE.retriever else None,
         'retrieval_threshold':SERVICE.threshold,'adapter':Path(os.environ.get('MEDLLM_ADAPTER',str(HOME/'runs/medical-v4'))).name,
         'answer_style':getattr(SERVICE,'answer_style','grounded_selection'),
+        'candidate_scope':SERVICE.candidate_scope,'max_options':SERVICE.max_options,
+        'reranker':SERVICE.reranker.name,'reranker_loaded':SERVICE.reranker.model is not None,
         'generator_backend':SERVICE.backend}
     if SERVICE.backend=='llamacpp':
         from llama_backend import probe

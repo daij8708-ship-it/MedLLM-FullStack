@@ -26,30 +26,50 @@
 |---|---|---|
 | `core` | 直接包含问题所需事实的句子 | 召回分母 |
 | `acceptable` | `core` ∪ 允许展示且不算答非所问的句子 | 严格精确率分母 |
-| `doc_scope` | 答案文档中文导读的全部句子 | 宽松精确率分母 |
+| `doc_scope` | 答案文档内的全部句子 | 宽松精确率分母 |
 
 派生指标：严格 `precision`、宽松 `lenient_precision`、`off_topic`（引到别的文档 = 真错误）、
 `recall`、`exact`、误拒/漏拒混淆矩阵、95% Wilson 区间；出错用例单独计数并排除，不静默当 0。
+`lenient_precision` 在下面的两个候选口径下都恒为 1.0（候选取自答案文档，宽松分母覆盖整篇文档），
+**是候选构造的恒等式，不用来做配置对比**；有区分度的是严格 P、padding、exact。
 
-**主结果**（54 例 × 2 选句模式 × 2 后端，0 错误）：
+**主结果 A**（54 例 × 2 选句模式 × 2 后端，0 错误；候选 = 线上默认 `summary_only`）：
 
-| 后端 | 模式 | 严格 P | 宽松 P | R | F1 | exact | 误拒 | 漏拒 | padding | 跨文档 |
-|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| llama.cpp | rag（基座选句） | 0.8854 | 1.0000 | 0.9688 | 0.9146 | 25/32 | 0/32 | 1/22 | 7 | 0 |
-| llama.cpp | sft_rag（微调选句） | 0.6250 | 1.0000 | 1.0000 | 0.7490 | 8/32 | 0/32 | 0/22 | 26 | 0 |
-| Transformers | rag | 0.9115 | 1.0000 | 1.0000 | 0.9406 | 26/32 | 0/32 | 1/22 | 7 | 0 |
-| Transformers | sft_rag | 0.5156 | 1.0000 | 1.0000 | 0.6709 | 2/32 | 0/32 | 0/22 | 35 | 0 |
+| 后端 | 模式 | 严格 P | R | F1 | exact | 误拒 | 漏拒 | padding | 跨文档 |
+|---|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| llama.cpp | rag（基座选句） | 0.8854 | 0.9688 | 0.9146 | 25/32 | 0/32 | 1/22 | 7 | 0 |
+| llama.cpp | sft_rag（微调选句） | 0.6250 | 1.0000 | 0.7490 | 8/32 | 0/32 | 0/22 | 26 | 0 |
+| Transformers | rag | 0.9115 | 1.0000 | 0.9406 | 26/32 | 0/32 | 1/22 | 7 | 0 |
+| Transformers | sft_rag | 0.5156 | 1.0000 | 0.6709 | 2/32 | 0/32 | 0/22 | 35 | 0 |
 
-四条结论：
+**主结果 B**（同一批 54 例，只换候选范围与排序方式；llama.cpp，`RAG_MAX_OPTIONS=16`）：
 
-1. **没有任何配置出现跨文档引用**：`off_topic = 0`、`lenient_precision = 1.0`。
+| 候选 / 排序 | 模式 | 严格 P | R | F1 | exact | padding |
+|---|---|---:|---:|---:|---:|---:|
+| 20 句导读 · 稠密 | rag | 0.8854 | 0.9688 | 0.9146 | 25/32 | 7 |
+| **343 句 · 稠密** | rag | **0.5208** | 0.9531 | 0.6636 | **3/32** | 32 |
+| **343 句 · 交叉编码重排** | rag | **0.4531** | 0.8906 | 0.6000 | 0/32 | 35 |
+| 20 句导读 · 稠密 | sft_rag | 0.6250 | 1.0000 | 0.7490 | 8/32 | 26 |
+| **343 句 · 稠密** | sft_rag | **0.4448** | 0.9219 | 0.5981 | **0/32** | 41 |
+| **343 句 · 交叉编码重排** | sft_rag | 0.4479 | 0.8906 | 0.5907 | 1/32 | 39 |
+
+六条结论：
+
+1. **候选宇宙是指标的一部分**：把可达句子从 20 扩到 343，召回没多救回任何一题
+   （两档都是 30/32 题的 `core` 进了窗口），严格精确率与 `exact` 显著下降
+   （`exact` 的 Wilson 区间 [0.612, 0.890] 与 [0.032, 0.242] 不重叠）。窄候选下的好分数含"题目被做简单了"的成分。
 2. **微调换来召回、付出 padding**：微调把 `recall` 拉到 1.0，但 padding 从 7 涨到 26/35 句——
-   它学会了“多选几句”，严格精确率反而低于基座。两个后端一致，不是某个运行时的副作用。
-3. **两个后端在这批样本上不可区分**：rag 的 F1 差 2.6 个百分点，`exact` 区间大幅重叠。
-4. **拒答方向干净但有 1 例漏拒**：`over_refusal = 0/32`，`under_refusal = 1/22`
-   （“电动牙刷每次充电时间及噪音分贝是多少？”被用刷牙句回答了，属答非所问）。
+   它学会了"多选几句"，严格精确率反而低于基座。两个后端一致，不是某个运行时的副作用。
+3. **交叉编码重排序不是解**（负面结果）：bge-reranker-v2-m3 把窗口**顺序**改了（只有 23/54 题顺序不变），
+   但窗口**集合**在 52/54 题上不变，精确率没恢复；反而有 29 题"同一批句子换了编号"就改变了模型的选句
+   （`sft_rag dev22/04`：`[1,2]`→`[1,11]`）。**瓶颈在选择器对编号的依赖，不在排序侧。**
+4. **两个后端在窄候选主表上不可区分**：rag 的 F1 差 2.6 个百分点，`exact` 区间大幅重叠。
+5. **拒答方向干净但有 1 例漏拒**：`over_refusal = 0/32`，`under_refusal = 1/22`
+   （"电动牙刷每次充电时间及噪音分贝是多少？"被用刷牙句回答了，属答非所问）。
+6. **单轮结果有噪声底**：同配置重复跑，冷启动那一轮与热轮差 2/54 行；报告只引用超出噪声底的差异，
+   并撤回了曾提出的 prompt-cache 归因（同 prompt 连发 8/8、交错 6/6 一致）。
 
-完整判据、单例分析与方法缺陷记录见 [`EVALUATION_SPAN_REPORT.md`](EVALUATION_SPAN_REPORT.md)。
+完整判据、机制统计、单例分析与方法缺陷记录见 [`EVALUATION_SPAN_REPORT.md`](EVALUATION_SPAN_REPORT.md)。
 
 ## 三、目录
 
@@ -62,6 +82,7 @@ selection_constraints.py  选句 JSON 的 token-trie 与 GBNF 约束
 query_plan.py             问题拆分、个人诊断/尺寸缺失等边界判定
 evidence_contract.py      选句提示词契约
 evidence_index.py         语料句子稳定索引（chunk_id + sha1(规范化句子)）
+reranker.py               候选句交叉编码重排序（可选，决定哪些句子进模型视野）
 gold_span.py              span 级金标准构建（标签唯一命中校验）
 span_metrics.py           指标与 Wilson 区间
 run_span_eval.py          span 级评测 runner（真实 HTTP）
@@ -138,13 +159,20 @@ python rag_api.py --port 7860 --open
 ### 5. 复现评测
 
 ```powershell
-python evidence_index.py                              # 句子索引
+python evidence_index.py --scope retrieved_sentences  # 句子索引（--scope 决定可达宇宙口径）
 python gold_span.py                                   # 金标准（标签唯一命中校验）
-python -m unittest test_rag -k Span -k Gold           # 指标与 gold 完整性单测
-python run_span_eval.py --backend llamacpp --modes rag,sft_rag --tag v2
+python -m unittest test_rag -v                        # 指标、gold 完整性、开关契约
+# 服务侧开关必须先对上，否则 runner 拒绝运行：
+#   $env:RAG_CANDIDATE_SCOPE = 'summary_only' | 'retrieved_sentences'
+#   $env:RAG_RERANKER        = 'none' | 'bge_reranker_v2_m3'
+#   $env:RAG_MAX_OPTIONS     = 1..16（默认 16）
+python run_span_eval.py --backend llamacpp --candidate-scope summary_only --reranker none --tag base
+python run_span_eval.py --backend llamacpp --candidate-scope retrieved_sentences --reranker none --tag wide
+python run_span_eval.py --backend llamacpp --candidate-scope retrieved_sentences --reranker bge_reranker_v2_m3 --tag rsrr
 ```
 
-`run_span_eval.py` 会核对接入的服务后端与 `--backend` 是否一致，不一致就拒绝运行，避免误标。
+`run_span_eval.py` 会逐一核对运行中服务的 `--backend` / `--candidate-scope` / `--reranker`
+与实际 `/api/status` 是否一致，任何一项不符就拒绝运行，避免产物被误标。
 
 ## 五、需要自己下载的依赖（不在本仓库）
 
@@ -153,6 +181,7 @@ python run_span_eval.py --backend llamacpp --modes rag,sft_rag --tag v2
 | DeepSeek-R1-Distill-Qwen-1.5B | 基座模型 | <https://huggingface.co/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B> · <https://modelscope.cn/models/deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B> |
 | LLaMA-Factory | SFT 训练框架 | <https://github.com/hiyouga/LLaMA-Factory> |
 | BAAI/bge-m3 | 检索向量模型 | <https://huggingface.co/BAAI/bge-m3> |
+| BAAI/bge-reranker-v2-m3 | 候选句重排序（可选，`RAG_RERANKER=bge_reranker_v2_m3` 时才加载） | <https://huggingface.co/BAAI/bge-reranker-v2-m3> · <https://modelscope.cn/models/BAAI/bge-reranker-v2-m3> |
 | llama.cpp | GGUF 转换 / 量化 / `llama-server` | <https://github.com/ggml-org/llama.cpp>（本项目用 release **b11681** 的 `llama-b11681-bin-win-cuda-12.4-x64.zip` + `cudart-llama-bin-win-cuda-12.4-x64.zip`） |
 | CDC 语料 | 评测语料来源 | 由 `corpus.py` 按 `SOURCES` 里的 6 个官方页面自动抓取 |
 
@@ -169,9 +198,13 @@ python run_span_eval.py --backend llamacpp --modes rag,sft_rag --tag v2
 2. 金标准由 AI 助手依据语料原文标注，**未经临床专家复核**；每个句子 key 都带原文可逐句审计。
 3. `core` 常为 1 句，召回分辨率粗（只能取 0 / 0.5 / 1）。
 4. 判据是“证据句选择”，不是医学正确性；系统本身是抽取式，不做自由生成。
-5. 选择器可见的候选句只有 6 篇中文导读共 20 句（242 句里的 8%），英文原文段落不进入候选。
-6. 上下文上限 4096 token，超限抛错而不是静默截断。
-7. 扫描件 PDF 无 OCR。
+5. 默认候选只覆盖 6 篇中文导读的 20 句（全语料 343 句）；`RAG_CANDIDATE_SCOPE=retrieved_sentences`
+   可扩到检索文档全部句子，但实测严格精确率 0.885→0.521、`exact` 25/32→3/32 且召不回（见主结果 B），
+   因此默认仍是窄候选。交叉编码重排也不能补救，已在报告里作为负面结果记录。
+6. 主结果 B 的宽候选与重排序对照只在 llama.cpp 后端上跑过，transformers 后端未在新开关下重跑。
+7. 同配置重复跑存在 ±1~2/54 行的冷启动不可复现；单轮数字不单独引用。
+8. 上下文上限 4096 token，超限抛错而不是静默截断。
+9. 扫描件 PDF 无 OCR。
 
 ## 八、更多文档
 

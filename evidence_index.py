@@ -12,7 +12,10 @@ import re
 from pathlib import Path
 
 from workspace import RAG as DATA
-SENTENCE_SPLIT = r'(?<=[。！？])\s*|\n+'
+
+# 中英混切：中文靠句末标点，英文靠「句点 + 空白 + 大写/引号/括号开头」。
+# 只写 `(?<=[.!?])\s+` 会把 2.5、e.g. the、U.S. embassy 误切，所以要求下一句以大写起头。
+SENTENCE_SPLIT = r'(?<=[。！？])\s*|(?<=[.!?])[ \t]+(?=[A-Z"\'(“‘])|\n+'
 
 
 def normalize(text):
@@ -48,14 +51,18 @@ def load_chunks():
     return json.loads((DATA / 'chunks.json').read_text(encoding='utf-8'))
 
 
-def reachable_keys(chunks):
-    """Keys the extractive selector can ever offer.
+def reachable_keys(chunks, scope='summary_only'):
+    """Keys the extractive selector can ever offer, per candidate scope.
 
-    ``evidence_sentences`` appends the first chunk's sentences and then skips every
-    later chunk unless it is an editorial summary, so in practice only the top-1
-    document's chunk is selectable. Recorded here so the report can state the
-    candidate universe instead of assuming the whole corpus is reachable.
+    ``summary_only`` reproduces the historical behaviour of ``evidence_sentences``: the
+    first chunk's sentences are taken and every later chunk is skipped unless it is an
+    editorial summary, so only the top-1 document's overview is selectable.
+    ``retrieved_sentences`` lets every retrieved chunk contribute sentences, so any chunk
+    that can surface in the top-3 becomes reachable — i.e. the whole corpus.
+    Recorded here so the report states the candidate universe instead of assuming it.
     """
+    if scope == 'retrieved_sentences':
+        return {e['key'] for e in index_sentences(chunks)}
     reachable = set()
     for chunk in chunks:
         if chunk['metadata'].get('kind') == 'editorial_summary':
@@ -65,13 +72,14 @@ def reachable_keys(chunks):
     return reachable
 
 
-def dump_index(path=None):
+def dump_index(path=None, scope='summary_only'):
     chunks = load_chunks()
     index = index_sentences(chunks)
-    reachable = reachable_keys(chunks)
+    reachable = reachable_keys(chunks, scope)
     for entry in index:
         entry['in_editorial_summary'] = entry['kind'] == 'editorial_summary'
     payload = {'corpus_sha256': hashlib.sha256((DATA / 'chunks.json').read_bytes()).hexdigest(),
+               'candidate_scope': scope,
                'chunks': len(chunks), 'sentences': len(index),
                'editorial_summary_sentences': sum(e['in_editorial_summary'] for e in index),
                'reachable_by_selector': len(reachable), 'index': index}
@@ -82,10 +90,16 @@ def dump_index(path=None):
 
 
 if __name__ == '__main__':
-    target, payload = dump_index()
+    import argparse
+    parser = argparse.ArgumentParser(description='Build the corpus sentence index.')
+    parser.add_argument('--scope', choices=('summary_only', 'retrieved_sentences'),
+                        default='summary_only', help='选择器候选范围，只影响 reachable_by_selector 的口径。')
+    args = parser.parse_args()
+    target, payload = dump_index(scope=args.scope)
     print(f"wrote {target}")
     print(f"chunks={payload['chunks']} sentences={payload['sentences']} "
-          f"editorial={payload['editorial_summary_sentences']} reachable={payload['reachable_by_selector']}")
+          f"editorial={payload['editorial_summary_sentences']} "
+          f"reachable={payload['reachable_by_selector']} scope={payload['candidate_scope']}")
     for entry in payload['index']:
         if entry['in_editorial_summary']:
             print(' ', entry['key'], '|', entry['doc_id'], '|', entry['text'])

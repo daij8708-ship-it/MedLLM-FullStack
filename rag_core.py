@@ -9,6 +9,7 @@ from pathlib import Path
 from corpus import DATA, HOME, extract_sections, make_chunks
 from evidence_contract import selection_prompt
 from query_plan import split_questions,personal_diagnosis,missing_detail,evidence_requirements,evidence_alignment,combine_results
+from reranker import rank_options, reranker_from_env
 from selection_constraints import selection_trie,allowed_next
 
 
@@ -106,17 +107,26 @@ def resolve_citations(answer,chunks):
     return citations,invalid
 
 
-def evidence_sentences(chunks):
-    """Give the model immutable sentence IDs; never accept generated medical text."""
+CANDIDATE_SCOPES=('summary_only','retrieved_sentences')
+
+
+def evidence_sentences(chunks,scope='summary_only'):
+    """Give the model immutable sentence IDs; never accept generated medical text.
+
+    ``summary_only`` is the historical behaviour: once the Chinese overview of the top
+    document is in, no later chunk contributes candidates, so the selector only ever sees
+    overview sentences. ``retrieved_sentences`` lets every retrieved chunk contribute,
+    which is what makes cross-document mistakes and same-document padding measurable.
+    Ranking and truncation happen in the caller, after every candidate has been scored.
+    """
+    if scope not in CANDIDATE_SCOPES:raise ValueError('候选范围只支持 '+' / '.join(CANDIDATE_SCOPES)+'。')
     options=[]
     for index,chunk in enumerate(chunks):
-        # Prefer the Chinese overview when present; originals remain visible as candidates.
-        if options and chunk['metadata'].get('kind')!='editorial_summary':continue
-        for sentence in re.split(r'(?<=[。！？])\s*|\n+',chunk['text']):
+        if scope=='summary_only' and options and chunk['metadata'].get('kind')!='editorial_summary':continue
+        for sentence in re.split(r'(?<=[。！？])\s*|(?<=[.!?])[ \t]+(?=[A-Z"\'(“‘])|\n+',chunk['text']):
             sentence=sentence.strip()
             if len(sentence)<8:continue
             options.append({'option':len(options)+1,'chunk_index':index,'text':sentence})
-            if len(options)>=16:return options
     return options
 
 
@@ -214,6 +224,14 @@ class RAGService:
         self.answer_style=os.environ.get('RAG_ANSWER_STYLE','grounded_selection')
         # 'llamacpp' (llama-server over HTTP) or 'transformers' (in-process 4-bit PEFT).
         self.backend=os.environ.get('RAG_GENERATOR_BACKEND','transformers')
+        # 选句候选范围；显式校验，写错就直接拒绝启动，不静默退回旧口径。
+        self.candidate_scope=os.environ.get('RAG_CANDIDATE_SCOPE','summary_only')
+        if self.candidate_scope not in CANDIDATE_SCOPES:
+            raise ValueError('RAG_CANDIDATE_SCOPE 只支持 '+' / '.join(CANDIDATE_SCOPES)+'。')
+        self.max_options=int(os.environ.get('RAG_MAX_OPTIONS','16'))
+        if not 1<=self.max_options<=16:raise ValueError('RAG_MAX_OPTIONS 必须在 1..16（受约束语法按 16 句枚举）。')
+        # 重排序器同样显式校验；权重惰性加载，没下载时不影响服务构造与测试。
+        self.reranker=reranker_from_env()
 
     def _make_generator(self):
         if self.backend=='llamacpp':
@@ -260,10 +278,12 @@ class RAGService:
         stage('正在加载或运行本地生成模型…')
         if self.generator is None:self.generator=self._make_generator()
         if mode in ('rag','sft_rag') and self.answer_style=='grounded_selection':
-            options=evidence_sentences(chunks)
+            options=evidence_sentences(chunks,self.candidate_scope)
             vectors=self.retrieval_ready().encode([query]+[s['text'] for s in options])
             for s,v in zip(options,vectors[1:]):s['sentence_score']=sum(a*b for a,b in zip(vectors[0],v))
-            options=sorted(options,key=lambda s:s['sentence_score'],reverse=True)
+            # 先给全部候选打分，再截断：截断在打分前做会让后到的块永远进不了候选。
+            if self.reranker.active:stage('重排序器正在给候选句打分…')
+            options=rank_options(options,self.reranker,query,self.max_options)
             for n,s in enumerate(options):s['option']=n+1
             task=selection_prompt(query,options)
             result=self.generator.generate(task,'sft' if mode=='sft_rag' else 'base',cancel=cancel,max_tokens=64)

@@ -15,7 +15,7 @@ import hashlib
 import json
 from pathlib import Path
 
-from evidence_index import DATA, dump_index, normalize, split_sentences
+from evidence_index import DATA, dump_index, load_chunks, normalize, reachable_keys, split_sentences
 
 LABELS = [
     ('F1', 'food', '预防食源性疾病的四个步骤'),
@@ -115,12 +115,11 @@ def load_cases(suite):
 
 
 def build():
-    _, payload = dump_index()
+    _, payload = dump_index(scope='retrieved_sentences')
     index, resolved = payload['index'], resolve_labels(payload['index'])
-    summary_keys = {}
+    doc_keys = {}
     for entry in index:
-        if entry['in_editorial_summary']:
-            summary_keys.setdefault(entry['doc_id'], []).append(entry['key'])
+        doc_keys.setdefault(entry['doc_id'], []).append(entry['key'])
     cases, counts = [], {'answer': 0, 'refuse': 0}
     for suite in ('dev22', 'frozen16', 'regression16'):
         source = load_cases(suite)
@@ -137,7 +136,7 @@ def build():
             core_labels, acceptable_labels, doc = ANNOTATIONS[suite][ident]
             assert set(core_labels) <= set(acceptable_labels), f'{suite}/{ident}: core not subset'
             docs = doc if isinstance(doc, list) else [doc]
-            scope = sorted({k for d in docs for k in summary_keys.get(d, [])})
+            scope = sorted({k for d in docs for k in doc_keys.get(d, [])})
             counts['answer'] += 1
             cases.append({'suite': suite, 'id': ident, 'question': case['q'], 'expected': 'answer',
                           'core_labels': core_labels, 'acceptable_labels': acceptable_labels,
@@ -145,24 +144,33 @@ def build():
                           'acceptable': [resolved[l]['key'] for l in acceptable_labels],
                           'doc_scope': scope, 'expected_doc': doc,
                           'previous': case.get('previous')})
+    reachable_narrow = len(reachable_keys(load_chunks(), 'summary_only'))
     gold = {
-        'name': 'evidence-gold-v1',
+        'name': 'evidence-gold-v2',
+        'supersedes': 'evidence-gold-v1',
         'corpus_sha256': payload['corpus_sha256'],
         'sentence_index': {'chunks': payload['chunks'], 'sentences': payload['sentences'],
-                           'reachable_by_selector': payload['reachable_by_selector']},
+                           'editorial_summary_sentences': payload['editorial_summary_sentences'],
+                           'reachable_summary_only': reachable_narrow,
+                           'reachable_retrieved_sentences': payload['reachable_by_selector']},
         'protocol': {
             'core': '句子直接包含回答问题所需事实（召回分母）',
-            'acceptable': '允许展示且不算答非所问的句子，core 的超集（精确率分母）',
-            'unsupported': '被选中但不在 acceptable 内 = 无关句',
+            'acceptable': '允许展示且不算答非所问的句子，core 的超集（严格精确率分母）',
+            'doc_scope': '答案文档的全部句子（宽松精确率分母）；v1 只算了该文档的中文导读句',
+            'padding': '选中但在 acceptable 内、仍在 doc_scope 内 = 同文档冗余引用',
+            'off_topic': '选中但不在 doc_scope 内 = 引到了别的文档',
             'gold_source': '只从冻结语料句子中挑选，builder 校验每个标签唯一命中；未撰写任何新文本',
             'annotator': 'AI 助手依据语料原文标注，未经临床专家复核；判据可逐句审计',
-            'reachability': '选择器的候选集实际只来自 top-1 文档的中文导读块，故 core 均在导读句内',
+            'why_v2': 'v1 的候选只来自 top-1 文档的导读句，因此 lenient_precision 恒为 1.0——那是候选集'
+                      '构造出来的恒等式而不是模型能力；同时旧切分器不切英文句点，英文段落大多整块成一句。'
+                      'v2 修正切分并把 doc_scope 扩到答案文档全部句子，core/acceptable 保持 v1 的导读句不变，'
+                      '因此召回与 exact 仍可与 v1 直接比较。',
         },
         'label_map': {k: {'key': v['key'], 'doc_id': v['doc_id'], 'text': v['text']} for k, v in resolved.items()},
         'counts': {'cases': len(cases), **counts},
         'cases': cases,
     }
-    target = DATA / 'gold' / 'evidence-gold-v1.json'
+    target = DATA / 'gold' / 'evidence-gold-v2.json'
     target.write_text(json.dumps(gold, ensure_ascii=False, indent=2), encoding='utf-8')
     digest = hashlib.sha256(target.read_bytes()).hexdigest()
     return target, gold, digest
