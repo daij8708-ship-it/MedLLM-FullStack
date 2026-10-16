@@ -466,6 +466,68 @@ class CandidateScopeTests(unittest.TestCase):
             os.environ.pop('RAG_CANDIDATE_SCOPE', None)
 
 
+class MinScoreTests(unittest.TestCase):
+    """检索阈值是拒答的第一道闸：缺省值有依据、写错必须拒绝启动、边界行为可测。"""
+
+    @staticmethod
+    def _service(score):
+        chunk = {'id': 'c1', 'text': '成人应每天使用含氟牙膏认真刷牙两次。',
+                 'metadata': {'kind': 'editorial_summary'}, 'score': score}
+
+        class Retrieval:
+            def search(self, *args, **kwargs): return [chunk]
+            def expand_context(self, hits): return hits
+            def encode(self, texts): return [[1., 0.] for _ in texts]
+
+        class Generation:
+            def generate(self, *args, **kwargs):
+                return {'text': '{"sentences":[1]}', 'warnings': [], 'cancelled': False,
+                        'tokens': 2, 'seconds': .1, 'truncated': False, 'citations': []}
+
+        service = RAGService()
+        service.retriever = Retrieval()
+        service.generator = Generation()
+        return service
+
+    def test_default_is_the_measured_operating_point(self):
+        import os, rag_core
+        saved = os.environ.pop('RAG_MIN_SCORE', None)
+        try:
+            self.assertEqual(rag_core.RAGService().threshold, rag_core.DEFAULT_MIN_SCORE)
+            self.assertEqual(rag_core.DEFAULT_MIN_SCORE, 0.48)
+        finally:
+            if saved is not None: os.environ['RAG_MIN_SCORE'] = saved
+
+    def test_explicit_value_is_honoured(self):
+        import os, rag_core
+        os.environ['RAG_MIN_SCORE'] = '0.52'
+        try:
+            self.assertEqual(rag_core.RAGService().threshold, 0.52)
+        finally:
+            os.environ.pop('RAG_MIN_SCORE', None)
+
+    def test_bad_values_are_rejected_rather_than_defaulted(self):
+        import os, rag_core
+        for bad in ('abc', '0.05', '0.99', ''):
+            os.environ['RAG_MIN_SCORE'] = bad
+            try:
+                if bad == '':
+                    self.assertEqual(rag_core.RAGService().threshold, rag_core.DEFAULT_MIN_SCORE)
+                else:
+                    with self.assertRaises(ValueError):
+                        rag_core.RAGService()
+            finally:
+                os.environ.pop('RAG_MIN_SCORE', None)
+
+    def test_gate_refuses_just_below_and_answers_just_above(self):
+        below = self._service(0.479).ask('成人每天刷牙几次？', 'rag')
+        self.assertTrue(below['abstained'])
+        self.assertEqual(below['abstention_reason'], 'low_retrieval_score')
+        above = self._service(0.481).ask('成人每天刷牙几次？', 'rag')
+        self.assertFalse(above['abstained'])
+        self.assertTrue(above['text'])
+
+
 class RerankerTests(unittest.TestCase):
     """重排序决定哪些候选进模型视野，所以开关必须显式、可测、缺权重时明确报错。"""
 

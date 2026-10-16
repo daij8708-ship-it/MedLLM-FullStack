@@ -13,6 +13,13 @@ from query_plan import split_questions,personal_diagnosis,missing_detail,evidenc
 from reranker import rank_options, reranker_from_env
 from selection_constraints import selection_trie,allowed_next
 
+# 检索相似度阈值的缺省值，取自 110 例金标准上的阈值扫描（见 EVALUATION_SPAN_REPORT.md §6.2）：
+# 0.45 → 0.48 在四种窄候选配置上都不新增误拒，却把漏拒从 13/40 降到 10/40（sft 档 4/40 → 2/40）；
+# 再往上（0.52 / 0.58）每救回 1~2 例漏拒，就要在可答题上多误拒 1~2 例甚至 5 例，
+# 属于"宁可少答还是宁可答错"的策略选择，因此不写进缺省值。
+DEFAULT_MIN_SCORE=0.48
+MIN_SCORE_RANGE=(0.30,0.90)
+
 
 class Retriever:
     def __init__(self):
@@ -238,7 +245,7 @@ class RAGService:
     def __init__(self):
         self.retriever=None;self.generator=None
         self._retrieval_init=threading.Lock()
-        self.threshold=float(os.environ.get('RAG_MIN_SCORE','0.45'))
+        self.threshold=self._min_score()
         self.answer_style=os.environ.get('RAG_ANSWER_STYLE','grounded_selection')
         # 'llamacpp' (llama-server over HTTP) or 'transformers' (in-process 4-bit PEFT).
         self.backend=os.environ.get('RAG_GENERATOR_BACKEND','transformers')
@@ -256,6 +263,19 @@ class RAGService:
             from llama_backend import LlamaServerGenerator
             return LlamaServerGenerator()
         return Generator()
+
+    @staticmethod
+    def _min_score():
+        """显式校验阈值：写错就拒绝启动，不静默退回缺省（否则"以为调了"最危险）。"""
+        raw=os.environ.get('RAG_MIN_SCORE')
+        try:
+            value=float(raw) if raw not in (None,'') else DEFAULT_MIN_SCORE
+        except ValueError:
+            raise ValueError(f'RAG_MIN_SCORE 必须是数字，当前是 {raw!r}。') from None
+        low,high=MIN_SCORE_RANGE
+        if not low<=value<=high:
+            raise ValueError(f'RAG_MIN_SCORE 必须在 {low}..{high} 之间，当前是 {value}。')
+        return value
 
     def retrieval_ready(self):
         with self._retrieval_init:
