@@ -25,8 +25,10 @@ v4 相对 v3 的关键变化：**题量 54 → 110**（新增 56 例，写完才
 ## 2. 语料、索引与金标准
 
 - 语料：`chunks.json` 67 段，sha256 `e12a92186cf0c195…`（冻结未改）。分句器已支持英文句点，语料句子数 242 → **343**。
-- 候选宇宙是显式开关 `RAG_CANDIDATE_SCOPE`：`summary_only`（仅 top-1 文档中文导读，可达 **20** 句）与
-  `retrieved_sentences`（检索文档全部句子，可达 **343** 句）；可达句数由 `evidence_index.reachable_keys()` 算出并写入索引产物。
+- 候选宇宙是显式开关 `RAG_CANDIDATE_SCOPE`：`summary_only`（仅 top-1 文档中文导读，可达 **20** 句）、
+  `retrieved_sentences`（检索文档全部句子，可达 **343** 句），以及线上默认的 `auto`（有中文导读的文档按
+  `summary_only`、没有导读的上传文档按 `retrieved_sentences`）；可达句数由 `evidence_index.reachable_keys()`
+  算出并写入索引产物。评测仍固定使用两个具体口径，结果不受 `auto` 影响。
 - 金标准：`evidence-gold-v3.json`（`supersedes: evidence-gold-v2`，sha256 `e375ed32…`），**110 例 = 70 可答 + 40 拒答**：
   | 套件 | 题数 | 可答 | 拒答 | 来源 |
   |---|---:|---:|---:|---|
@@ -264,8 +266,17 @@ v4 相对 v3 的关键变化：**题量 54 → 110**（新增 56 例，写完才
   依赖见 `requirements-ocr.txt`（rapidocr-onnxruntime 1.4.4 + pypdfium2 5.14.0，权重随 wheel 自带、运行时离线）。
 - 实现：**只有没有文本层的页**才渲染成图片做 OCR（`pages_needing_ocr`），有文本的页仍走 pypdf，不被覆盖；
   OCR 过的页在段落与 chunk 元数据里标 `ocr: true`，前端引用弹窗会提示"本页为扫描件 OCR 识别，可能有错字，请对照原件"。
-- 实测（真实上传接口，非模拟）：1 页扫描样张 pypdf 抽取 0 字符 → OCR 得 502 字 → 入库 1 段、`ocr=true` →
+- PDF 与 OCR 文本在切块前做**行级重排**：段内换行合并、行尾连字符去掉；页码、表格行、图表标签与标题保持独立。
+  这是为了让 `evidence_sentences` 看到完整句而不是版面碎片（`immuniza-\ntion` 曾经被切成 `The 2025 adult immuniza-`）。
+  重排不恢复表格结构，也不补齐图表里的文字。
+- 真实扫描件（HHS OIG 1985 半年报前 10 页，pypdf 抽出 0 字符）在独立测试库经真实上传接口跑通：
+  10 页 OCR 共 5,607 字、入库 11 段、`ocr=true`，检索与引用绑定正常；其中图表页第 4/6/8 页为 0 字，
+  选中句仍受 OCR 断行与错误影响（`OIG` → `OlG`、`OUTLAYSFORFY`）。**未在真实扫描件上计算 CER**。
+- 实测（真实 `/api/documents` 上传接口；**样张是脚本渲染的合成扫描件，不是真实拍摄/扫描件**）：1 页样张 pypdf 抽取 0 字符 → OCR 得 502 字 → 入库 1 段、`ocr=true` →
   提问"每日食盐摄入量建议不超过多少克？"命中该文档，回答引用 OCR 文本，引用元数据 `ocr=True`。
+- 同一张合成样张上做过引擎对比（对 ground truth 算 CER，去空白后编辑距离）：rapidocr **0.21%**、
+  tesseract(fast) 3.81%、easyocr 5.72%，故选用 rapidocr。**该数字只覆盖清晰、正向、无噪声的合成图**；
+  真实扫描件的倾斜、噪点、印章、表格、手写与低分辨率均未测试，也未在真实扫描件上评测 CER。
 - **OCR 的真实缺陷**：中英混排时英文词间空格会丢（`Reduce salt` → `Reducesalt`、`BMI` → `BMl`）。
   因为系统是**逐字展示引用**的，识别错字会原样出现在回答里——所以引用弹窗必须带 OCR 提示，这一条也写进限制。
 - 许可证：rapidocr-onnxruntime（Apache-2.0）、pypdfium2（BSD-3-Clause/Apache-2.0）、onnxruntime（MIT）。
@@ -327,7 +338,7 @@ v4 相对 v3 的关键变化：**题量 54 → 110**（新增 56 例，写完才
   另实现扫描件 OCR 通道（离线、页级标记、引用处提示错字风险）。
 - 不可写：任何形如"准确率 9x%"的整体准确率；把抽取式选句指标说成医学问答准确率；
   把 `lenient_precision≈0.98` 说成"零无关引用"；把重排序说成"提升了精度"；
-  把 OCR 说成"扫描件识别准确"（英文空格会丢，未做 CER 评测）；
+  把 OCR 说成"扫描件识别准确"（英文空格会丢；仅在合成样张上测得 CER 0.21%，真实扫描件未评测）；
   说"两后端结果一致"（方向一致，绝对值不一致）；说"拒答问题已解决"（只修掉最省的 3 例，
   且 0.48 是贴 110 例样本取的）。
 

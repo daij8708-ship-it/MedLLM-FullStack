@@ -68,6 +68,68 @@ def pages_needing_ocr(pages):
     return [page['page'] for page in pages if not page['text'].strip()]
 
 
+def _is_url_fragment(s):
+    return bool(re.search(r'(?:https?://|www\.)$',s,re.I) or s.endswith('/'))
+
+
+def _join_separator(prev,line):
+    """拉丁字母/数字之间补一个空格；中文与 URL 续行不补。"""
+    if not line or not prev:return ''
+    if re.match(r'^[)\]}.,;:!?]',line):return ''
+    if line.startswith('(') and re.search(r'[A-Za-z0-9]$',prev):return ' '
+    if _is_url_fragment(prev):return ''
+    if re.match(r'[A-Za-z0-9]',line) and re.search(r'[A-Za-z0-9,;:)\].!?]$',prev):return ' '
+    if re.match(r'[A-Za-z0-9]',line) and re.search(r'[\u4e00-\u9fff]$',prev):return ' '
+    return ''
+
+
+def _ends_sentence(s):
+    return bool(re.search(r'[。！？!?;；:：]$',s) or (s.endswith('.') and not _is_url_fragment(s)))
+
+
+def _starts_new_block(line):
+    """判断一行是否开启新块，以及该块是否不允许下一行并入。
+
+    ``starts_new_block``：项目符号、编号条目、脚注、表格/图表行。
+    ``keep_isolated``：此外还包括页码、表格行、标题、作者行——下一行不得并进来。
+    """
+    s=line.strip()
+    if not s:return True,True
+    if re.fullmatch(r'\d{1,3}',s):return True,True
+    if '\t' in s or re.search(r'\s{2,}',s) or '|' in s:return True,True
+    if len(s)<=40 and re.search(r'[$%]',s):return True,True
+    if re.fullmatch(r'[\d.,]+',s):return True,True
+    if re.match(r'^(?:[•·▪◦]|\d+[.)、]\s|[一二三四五六七八九十]+、|[*†‡])',s):return True,False
+    if len(s)<=40 and not re.search(r'[。！？!?;；:：]$',s) and s.upper()==s and re.search(r'[A-Z]',s):return True,True
+    if re.match(r'^[A-Z]\.\s',s):return True,True
+    return False,False
+
+
+def reflow_text(text):
+    """切块前还原 PDF/OCR 的硬换行。
+
+    PDF 与 OCR 文本是按版面逐行给出的：一句话在列宽处被切断，单词可能带行尾连字符。
+    这里把同一段内的行接回去，``evidence_sentences`` 才能看到完整句子。
+    标题、项目符号、表格/图表行和页码保留为块边界；HTML/TXT/MD 不经过本函数。
+    """
+    text=text.replace('\r\n','\n').replace('\r','\n')
+    paragraphs=re.split(r'\n\s*\n',text)
+    out=[]
+    for para in paragraphs:
+        lines=[l.strip() for l in para.splitlines() if l.strip()]
+        blocks=[];isolated=[]
+        for line in lines:
+            new,iso=_starts_new_block(line)
+            if not blocks or new or isolated[-1] or _ends_sentence(blocks[-1]):
+                blocks.append(line);isolated.append(iso)
+            elif blocks[-1].endswith('-') and re.match(r'[A-Za-z0-9]',line):
+                blocks[-1]=blocks[-1][:-1]+line
+            else:
+                blocks[-1]=blocks[-1]+_join_separator(blocks[-1],line)+line
+        if blocks:out.append('\n'.join(blocks))
+    return '\n\n'.join(out)
+
+
 def extract_sections(data, filename):
     """Return page/section text; scanned pages go through OCR only when RAG_PDF_OCR enables it."""
     suffix=Path(filename).suffix.lower()
@@ -77,12 +139,12 @@ def extract_sections(data, filename):
         if reader.is_encrypted:
             raise ValueError('暂不支持加密PDF。')
         if len(reader.pages)>200:raise ValueError('PDF最多支持200页，请拆分文档。')
-        result=[{'section':f'第{i+1}页','page':i+1,'text':(p.extract_text() or '').strip()} for i,p in enumerate(reader.pages)]
+        result=[{'section':f'第{i+1}页','page':i+1,'text':reflow_text((p.extract_text() or '').strip())} for i,p in enumerate(reader.pages)]
         blank=pages_needing_ocr(result)
         if blank and pdf_ocr_mode()=='rapidocr':
             by_number={page['page']:page for page in result}
             for number,text in zip(blank,ocr_pdf_pages(data,blank)):
-                by_number[number]['text']=text;by_number[number]['ocr']=True
+                by_number[number]['text']=reflow_text(text);by_number[number]['ocr']=True
         if not any(x['text'].strip() for x in result):
             if pdf_ocr_mode()=='rapidocr':
                 raise ValueError('PDF未提取到文字，OCR 也没有识别出内容；请检查扫描质量或改用文字版 PDF。')

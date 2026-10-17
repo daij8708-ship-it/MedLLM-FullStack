@@ -176,6 +176,9 @@ pip install -r requirements-ocr.txt
 $env:RAG_PDF_OCR = 'rapidocr'      # off（默认）/ rapidocr，写错直接拒绝启动
 ```
 
+PDF 与 OCR 文本在切块前会先做段内换行合并与去连字符（例如 `immuniza-\ntion` → `immunization`），
+否则句子会按版面列宽被切碎。重排只修换行，不恢复表格和图表的语义。
+
 ### 5. 复现评测
 
 ```powershell
@@ -183,7 +186,7 @@ python evidence_index.py --scope retrieved_sentences  # 句子索引（--scope �
 python gold_span.py                                   # 金标准（标签唯一命中校验）
 python -m unittest test_rag -v                        # 指标、gold 完整性、开关契约
 # 服务侧开关必须先对上，否则 runner 拒绝运行：
-#   $env:RAG_CANDIDATE_SCOPE = 'summary_only' | 'retrieved_sentences'
+#   $env:RAG_CANDIDATE_SCOPE = 'auto'（默认） | 'summary_only' | 'retrieved_sentences'
 #   $env:RAG_RERANKER        = 'none' | 'bge_reranker_v2_m3'
 #   $env:RAG_MAX_OPTIONS     = 1..16（默认 16）
 #   $env:RAG_MIN_SCORE       = 0.30..0.90（默认 0.48；写错或超范围会拒绝启动）
@@ -225,10 +228,11 @@ python run_span_eval.py --backend llamacpp --candidate-scope retrieved_sentences
    剩下 7 例是个人判断/药物/商品这类**语义**问题（剂量、疫苗、高血压、肠镜等），
    与候选范围、生成后端都无关。修法在拒答判定（规则或分类器），不在排序。
    另外 0.48 是贴 110 例样本取的（与可答题最小余弦只差 0.011），**换语料要重扫**。
-6. 默认候选只覆盖 6 篇中文导读的 20 句（全语料 343 句）；`RAG_CANDIDATE_SCOPE=retrieved_sentences`
-   可扩到检索文档全部句子，但实测严格精确率 0.802→0.463、`exact` 41/70→3/70 且召回也降；
-   transformers 后端同向但幅度小得多（0.821→0.593）。因此默认仍是窄候选。
-   交叉编码重排不能补救（两个后端都不恢复精确率），已作为负面结果记录。
+6. `RAG_CANDIDATE_SCOPE` 默认 `auto`：有中文导读的 CDC 六篇仍走窄候选（20 句），
+   没有导读的上传文档走检索文档的全部句子。宽候选对 CDC 语料是负收益（严格精确率 0.802→0.463、
+   `exact` 41/70→3/70 且召回也降），所以 `auto` 不会把它套到 CDC 上；显式 `retrieved_sentences`
+   仍可用于对照。用户上传的 TXT/PDF/扫描件默认走宽候选，否则只有 top chunk 能成为选句候选。
+   交叉编码重排不能补救 CDC 语料的精确率（两个后端都不恢复），已作为负面结果记录。
 7. 宽候选与重排序对照已在两个后端各跑完三组（llama.cpp 与 Transformers）。**两后端方向一致，
    但绝对指标不可互换**（宽候选 rag 档 0.463 vs 0.593，`exact` 区间不重叠），可跨后端引用的只有方向与拒答计数。
 8. **噪声底分区间**：窄候选档逐字复现，llama.cpp 的 16 句候选档有 1~5/110 的选句漂移
@@ -238,9 +242,11 @@ python run_span_eval.py --backend llamacpp --candidate-scope retrieved_sentences
    六份产物共 1320 条记录的 `context_trimmed` 全部为 0；该路径由单测与定向验证覆盖。
 10. 评测在服务刚重启、索引未就绪时就发第一个请求，可能撞上连接超时（本轮 1 例，已单独重问成功）；
     接入时建议先等 `/api/status` 的 `ready`。
-10. 扫描件 PDF 需显式开启 OCR（`RAG_PDF_OCR=rapidocr`）并安装 `requirements-ocr.txt`；默认关闭。
+11. 扫描件 PDF 需显式开启 OCR（`RAG_PDF_OCR=rapidocr`）并安装 `requirements-ocr.txt`；默认关闭。
     实测中文识别可用，但**英文词间空格会丢**（`Reduce salt`→`Reducesalt`），而引用是逐字展示的，
-    所以 OCR 页会带 `ocr=true` 标记并在引用弹窗提示对照原件；未做 CER 评测。
+    所以 OCR 页会带 `ocr=true` 标记并在引用弹窗提示对照原件。合成样张上 CER 为 0.21%，
+    **真实扫描件未评测 CER**；图表页 OCR 可能为 0 字符。
+12. PDF/OCR 重排是行级启发式：能修段内换行和行尾连字符，不恢复表格结构，也不补齐图表里的文字。
 
 ## 八、更多文档
 

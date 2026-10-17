@@ -465,6 +465,74 @@ class CandidateScopeTests(unittest.TestCase):
         finally:
             os.environ.pop('RAG_CANDIDATE_SCOPE', None)
 
+    def test_auto_keeps_narrow_scope_for_a_document_with_a_summary(self):
+        from rag_core import resolve_candidate_scope
+        chunks = [{'text': '导读。', 'metadata': {'doc_id': 'cdc', 'kind': 'editorial_summary'}},
+                  {'text': '正文。', 'metadata': {'doc_id': 'cdc', 'kind': 'original'}}]
+        self.assertEqual(resolve_candidate_scope(chunks, 'auto'), 'summary_only')
+
+    def test_auto_widens_scope_for_an_upload_without_a_summary(self):
+        from rag_core import resolve_candidate_scope
+        chunks = [{'text': '正文。', 'metadata': {'doc_id': 'upload_1', 'kind': 'original'}}]
+        self.assertEqual(resolve_candidate_scope(chunks, 'auto'), 'retrieved_sentences')
+
+    def test_auto_is_decided_by_the_top_document_only(self):
+        from rag_core import resolve_candidate_scope
+        chunks = [{'text': '上传正文。', 'metadata': {'doc_id': 'upload_1', 'kind': 'original'}},
+                  {'text': 'CDC 导读。', 'metadata': {'doc_id': 'food', 'kind': 'editorial_summary'}}]
+        self.assertEqual(resolve_candidate_scope(chunks, 'auto'), 'retrieved_sentences')
+
+    def test_explicit_scope_is_not_rewritten(self):
+        from rag_core import resolve_candidate_scope
+        chunks = [{'text': '正文。', 'metadata': {'doc_id': 'upload_1', 'kind': 'original'}}]
+        self.assertEqual(resolve_candidate_scope(chunks, 'summary_only'), 'summary_only')
+        self.assertEqual(resolve_candidate_scope(chunks, 'retrieved_sentences'), 'retrieved_sentences')
+
+    def test_auto_is_not_a_concrete_selector_scope(self):
+        from rag_core import evidence_sentences
+        with self.assertRaises(ValueError):
+            evidence_sentences(self.CHUNKS, 'auto')
+
+
+class ReflowTests(unittest.TestCase):
+    """PDF/OCR 的硬换行必须在切句前还原。"""
+
+    def test_dehyphenates_a_wrapped_word(self):
+        import corpus
+        text = corpus.reflow_text('The 2025 adult immuniza-\ntion schedule can be found.')
+        self.assertIn('immunization schedule', text)
+        self.assertNotIn('immuniza-\n', text)
+
+    def test_joins_wrapped_latin_lines_with_one_space(self):
+        import corpus
+        text = corpus.reflow_text('The schedule supports health care provid-\ners, as well as public health.')
+        self.assertEqual(text, 'The schedule supports health care providers, as well as public health.')
+
+    def test_joins_wrapped_chinese_without_a_space(self):
+        import corpus
+        text = corpus.reflow_text('高血壓是指以體循環動脈血壓\n持續升高為主要表現。')
+        self.assertEqual(text, '高血壓是指以體循環動脈血壓持續升高為主要表現。')
+
+    def test_keeps_page_numbers_table_rows_and_chart_labels_isolated(self):
+        import corpus
+        text = corpus.reflow_text('Morbidity and Mortality Weekly Report\n30\n'
+                                  'U.S. Department of Health  |  CDC\n'
+                                  'SSA 67.17%\n$212.6\nThis OIG report describes the period.')
+        lines = text.splitlines()
+        self.assertIn('30', lines)
+        self.assertIn('SSA 67.17%', lines)
+        self.assertIn('$212.6', lines)
+        self.assertIn('This OIG report describes the period.', lines)
+
+    def test_keeps_blank_line_paragraph_breaks(self):
+        import corpus
+        self.assertEqual(corpus.reflow_text('第一段。\n\n第二段。'), '第一段。\n\n第二段。')
+
+    def test_txt_input_is_not_reflowed(self):
+        import corpus
+        sections = corpus.extract_sections(b'line one\nline two', 'sample.txt')
+        self.assertEqual(sections[0]['text'], 'line one\nline two')
+
 
 class MinScoreTests(unittest.TestCase):
     """检索阈值是拒答的第一道闸：缺省值有依据、写错必须拒绝启动、边界行为可测。"""

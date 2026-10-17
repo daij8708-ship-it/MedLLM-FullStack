@@ -116,6 +116,24 @@ def resolve_citations(answer,chunks):
 
 
 CANDIDATE_SCOPES=('summary_only','retrieved_sentences')
+CONFIGURED_SCOPES=CANDIDATE_SCOPES+('auto',)
+
+
+def resolve_candidate_scope(chunks,configured):
+    """把配置口径解析成两个具体口径之一。
+
+    ``auto`` 对带中文导读的文档（CDC 六篇）沿用历史的窄口径；对没有导读的用户上传文档，
+    让每个检索到的 chunk 都贡献候选。判定只看排名第一的文档——别的文档带导读，
+    不能把上传文档误判成窄候选。
+    """
+    if configured not in CONFIGURED_SCOPES:
+        raise ValueError('候选范围只支持 '+' / '.join(CONFIGURED_SCOPES)+'。')
+    if configured!='auto':return configured
+    if not chunks:return 'summary_only'
+    top=chunks[0]['metadata'].get('doc_id')
+    narrow=any(c['metadata'].get('doc_id')==top and c['metadata'].get('kind')=='editorial_summary'
+               for c in chunks)
+    return 'summary_only' if narrow else 'retrieved_sentences'
 
 
 def evidence_sentences(chunks,scope='summary_only'):
@@ -250,9 +268,10 @@ class RAGService:
         # 'llamacpp' (llama-server over HTTP) or 'transformers' (in-process 4-bit PEFT).
         self.backend=os.environ.get('RAG_GENERATOR_BACKEND','transformers')
         # 选句候选范围；显式校验，写错就直接拒绝启动，不静默退回旧口径。
-        self.candidate_scope=os.environ.get('RAG_CANDIDATE_SCOPE','summary_only')
-        if self.candidate_scope not in CANDIDATE_SCOPES:
-            raise ValueError('RAG_CANDIDATE_SCOPE 只支持 '+' / '.join(CANDIDATE_SCOPES)+'。')
+        # auto：有中文导读的文档用 summary_only，没有导读的上传文档用 retrieved_sentences。
+        self.candidate_scope=os.environ.get('RAG_CANDIDATE_SCOPE','auto')
+        if self.candidate_scope not in CONFIGURED_SCOPES:
+            raise ValueError('RAG_CANDIDATE_SCOPE 只支持 '+' / '.join(CONFIGURED_SCOPES)+'。')
         self.max_options=int(os.environ.get('RAG_MAX_OPTIONS','16'))
         if not 1<=self.max_options<=16:raise ValueError('RAG_MAX_OPTIONS 必须在 1..16（受约束语法按 16 句枚举）。')
         # 重排序器同样显式校验；权重惰性加载，没下载时不影响服务构造与测试。
@@ -316,7 +335,8 @@ class RAGService:
         stage('正在加载或运行本地生成模型…')
         if self.generator is None:self.generator=self._make_generator()
         if mode in ('rag','sft_rag') and self.answer_style=='grounded_selection':
-            options=evidence_sentences(chunks,self.candidate_scope)
+            scope=resolve_candidate_scope(chunks,self.candidate_scope)
+            options=evidence_sentences(chunks,scope)
             vectors=self.retrieval_ready().encode([query]+[s['text'] for s in options])
             for s,v in zip(options,vectors[1:]):s['sentence_score']=sum(a*b for a,b in zip(vectors[0],v))
             # 先给全部候选打分，再截断：截断在打分前做会让后到的块永远进不了候选。
@@ -342,6 +362,7 @@ class RAGService:
                 result['warnings'].append(f'候选超出上下文上限，已按相关度丢弃末尾 {dropped} 句后作答，'
                                           f'本次只提供 {len(options)} 句候选。')
             result.update(model=mode,retrieved=chunks,raw_ranked_hits=hits,raw_model_text=raw,
+                          candidate_scope=scope,
                           raw_model_citations=[],selection_options=options,selection_raw=raw,
                           selection_attempts=attempts,format_retry=len(attempts)>1,
                           context_trimmed=dropped,
